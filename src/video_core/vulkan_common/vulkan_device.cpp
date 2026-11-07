@@ -1835,9 +1835,14 @@ void Device::RemoveUnsuitableExtensions() {
     RemoveExtensionFeatureIfUnsuitable(extensions.maintenance5, features.maintenance5,
                                        VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
 
-    // VK_KHR_pipeline_binary (needs maintenance5 for the capture flag)
+    // VK_KHR_pipeline_binary (needs maintenance5 for the capture flag). Only AMD's own drivers
+    // get it: they don't keep compiled pipelines between sessions, while NVIDIA's driver and
+    // Mesa keep their own disk caches (PipelineBinaryCache).
+    const VkDriverId binary_driver = properties.driver.driverID;
     extensions.pipeline_binary =
-        features.pipeline_binary.pipelineBinaries && extensions.maintenance5;
+        features.pipeline_binary.pipelineBinaries && extensions.maintenance5 &&
+        (binary_driver == VK_DRIVER_ID_AMD_PROPRIETARY ||
+         binary_driver == VK_DRIVER_ID_AMD_OPEN_SOURCE);
     RemoveExtensionFeatureIfUnsuitable(extensions.pipeline_binary, features.pipeline_binary,
                                        VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
 

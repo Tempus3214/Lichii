@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Lichii contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -23,12 +24,19 @@ namespace {
 // File: magic[8] u32 global_key_size u8 global_key[32], then records:
 //   u32 record_magic u32 key_size u8 key[32] u64 payload_size payload
 // Payload: u32 count, then per binary: u32 key_size u8 key[32] u64 data_size data
+// A later record for a key replaces an earlier one: a binary the driver rejects is saved again.
 constexpr std::array<char, 8> FILE_MAGIC{'L', 'C', 'H', 'P', 'B', 'I', 'N', '1'};
 constexpr u32 RECORD_MAGIC = 0x44524350;
 constexpr size_t KEY_BYTES = VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR;
 constexpr size_t HEADER_BYTES = FILE_MAGIC.size() + 4 + KEY_BYTES;
 constexpr size_t RECORD_HEADER_BYTES = 4 + 4 + KEY_BYTES + 8;
 constexpr u32 MAX_BINARIES_PER_PIPELINE = 64;
+
+// The file is rewritten when it closes if replaced records take at least MIN_DEAD_BYTES and a
+// quarter of it, or if it is larger than MAX_FILE_BYTES. Past that size the pipelines used in the
+// session are kept first, then the newest others, up to three quarters of it.
+constexpr u64 MAX_FILE_BYTES = 512ULL << 20;
+constexpr u64 MIN_DEAD_BYTES = 64ULL << 20;
 
 struct Stats {
     std::atomic<u64> loaded{}, compiled{}, saved{}, load_failed{}, skipped{};
@@ -47,76 +55,80 @@ public:
             LOG_WARNING(Render_Vulkan, "Pipeline binaries: the driver gave no global key");
             return false;
         }
-        std::array<u8, HEADER_BYTES> header{};
         std::memcpy(header.data(), FILE_MAGIC.data(), FILE_MAGIC.size());
         std::memcpy(header.data() + 8, &global.keySize, 4);
         std::memcpy(header.data() + 12, global.key, global.keySize);
 
         std::error_code ec;
         std::filesystem::create_directories(path.parent_path(), ec);
-        size_t good_end = 0;
+        u64 size = std::filesystem::file_size(path, ec);
+        if (ec) {
+            size = 0;
+        }
+        bool same_driver = false;
         {
-            std::ifstream in(path, std::ios::binary | std::ios::ate);
-            if (in) {
-                const auto size = static_cast<size_t>(in.tellg());
-                in.seekg(0);
-                loaded.resize(size);
-                if (!in.read(reinterpret_cast<char*>(loaded.data()), size)) {
-                    loaded.clear();
+            std::ifstream scan(path, std::ios::binary);
+            std::array<u8, HEADER_BYTES> found{};
+            same_driver = scan && size >= HEADER_BYTES &&
+                          scan.read(reinterpret_cast<char*>(found.data()), HEADER_BYTES) &&
+                          found == header;
+            if (same_driver) {
+                file_end = HEADER_BYTES;
+                std::array<u8, RECORD_HEADER_BYTES> record{};
+                while (file_end + RECORD_HEADER_BYTES <= size &&
+                       scan.read(reinterpret_cast<char*>(record.data()), RECORD_HEADER_BYTES)) {
+                    u32 magic, key_size;
+                    u64 len;
+                    std::memcpy(&magic, &record[0], 4);
+                    std::memcpy(&key_size, &record[4], 4);
+                    std::memcpy(&len, &record[8 + KEY_BYTES], 8);
+                    if (magic != RECORD_MAGIC || key_size == 0 || key_size > KEY_BYTES ||
+                        len > size - file_end - RECORD_HEADER_BYTES) {
+                        break;
+                    }
+                    const u64 payload = file_end + RECORD_HEADER_BYTES;
+                    Remember(std::string(reinterpret_cast<const char*>(&record[8]), key_size),
+                             {payload, len, false});
+                    file_end = payload + len;
+                    scan.seekg(static_cast<std::streamoff>(file_end));
                 }
             }
         }
-        const bool same_driver = loaded.size() >= HEADER_BYTES &&
-                                 std::memcmp(loaded.data(), header.data(), HEADER_BYTES) == 0;
         if (same_driver) {
-            size_t p = HEADER_BYTES;
-            good_end = p;
-            while (p + RECORD_HEADER_BYTES <= loaded.size()) {
-                u32 magic, key_size;
-                u64 len;
-                std::memcpy(&magic, &loaded[p], 4);
-                std::memcpy(&key_size, &loaded[p + 4], 4);
-                std::memcpy(&len, &loaded[p + 8 + KEY_BYTES], 8);
-                if (magic != RECORD_MAGIC || key_size == 0 || key_size > KEY_BYTES ||
-                    len > loaded.size() - p - RECORD_HEADER_BYTES) {
-                    break;
-                }
-                index.emplace(std::string(reinterpret_cast<const char*>(&loaded[p + 8]), key_size),
-                              Blob{&loaded[p + RECORD_HEADER_BYTES], static_cast<size_t>(len)});
-                p += RECORD_HEADER_BYTES + static_cast<size_t>(len);
-                good_end = p;
-            }
-            if (good_end < loaded.size()) {
+            if (file_end < size) {
                 // A session that ended mid-write leaves a partial record; drop it.
-                std::filesystem::resize_file(path, good_end, ec);
+                std::filesystem::resize_file(path, file_end, ec);
             }
             out.open(path, std::ios::binary | std::ios::app);
         } else {
             // First run, or the driver changed: binaries from another driver can't be used, so the
             // file is replaced rather than kept beside the new one.
-            if (!loaded.empty()) {
+            if (size != 0) {
                 LOG_INFO(Render_Vulkan, "Pipeline binaries: driver changed, starting over");
             }
-            loaded.clear();
+            index.clear();
+            dead_bytes = 0;
             out.open(path, std::ios::binary | std::ios::trunc);
             out.write(reinterpret_cast<const char*>(header.data()), header.size());
             out.flush();
+            file_end = HEADER_BYTES;
         }
-        if (!out) {
-            LOG_ERROR(Render_Vulkan, "Pipeline binaries: can't write {}", path.string());
+        in.open(path, std::ios::binary);
+        if (!out || !in) {
+            LOG_ERROR(Render_Vulkan, "Pipeline binaries: can't open {}", path.string());
             return false;
         }
-        LOG_INFO(Render_Vulkan, "Pipeline binaries: {} saved pipelines ({:.1f} MiB) in {}",
-                 index.size(), static_cast<double>(loaded.size()) / (1024.0 * 1024.0),
-                 path.string());
+        LOG_INFO(Render_Vulkan,
+                 "Pipeline binaries: {} saved pipelines ({:.1f} MiB, {:.1f} MiB replaced) in {}",
+                 index.size(), Mib(file_end), Mib(dead_bytes), path.string());
         return true;
     }
 
     void Close() {
-        std::unique_lock lock{mutex};
-        if (out.is_open()) {
-            out.close();
-        }
+        std::scoped_lock lock{mutex};
+        out.close();
+        Compact();
+        in.close();
         LOG_INFO(Render_Vulkan,
                  "Pipeline binaries: {} pipelines built from saved binaries (avg {:.2f} ms), {} "
                  "compiled (avg {:.2f} ms), {} saved, {} saved binaries rejected",
@@ -150,13 +162,16 @@ public:
         }
         const std::string key_bytes(reinterpret_cast<const char*>(key.key), key.keySize);
 
-        if (const auto blob = Find(key_bytes)) {
-            if (CreateFromSaved(*blob, ci, out_pipeline, create)) {
+        if (const auto payload = Read(key_bytes)) {
+            if (CreateFromSaved(*payload, ci, out_pipeline, create)) {
+                MarkUsed(key_bytes);
                 ++stats.loaded;
                 stats.loaded_us += elapsed_us();
                 *result = VK_SUCCESS;
                 return true;
             }
+            // Compiled and saved again below, replacing the rejected record.
+            Forget(key_bytes);
             if (stats.load_failed++ < 5) {
                 LOG_WARNING(Render_Vulkan, "Pipeline binaries: a saved pipeline was rejected, "
                                            "compiling it again");
@@ -195,10 +210,15 @@ public:
     }
 
 private:
-    struct Blob {
-        const u8* data;
-        size_t size;
+    struct Record {
+        u64 offset;
+        u64 size;
+        bool used;
     };
+
+    static double Mib(u64 bytes) {
+        return static_cast<double>(bytes) / (1024.0 * 1024.0);
+    }
 
     static double Average(const std::atomic<u64>& us, const std::atomic<u64>& count) {
         const u64 n = count.load();
@@ -225,20 +245,54 @@ private:
                !Find(ci.pNext, VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR);
     }
 
-    std::optional<Blob> Find(const std::string& key) {
-        std::shared_lock lock{mutex};
+    // Callers hold the mutex, or own the store alone (Open).
+    void Remember(const std::string& key, const Record& record) {
+        const auto [it, inserted] = index.try_emplace(key, record);
+        if (!inserted) {
+            dead_bytes += RECORD_HEADER_BYTES + it->second.size;
+            it->second = record;
+        }
+    }
+
+    std::optional<std::vector<u8>> Read(const std::string& key) {
+        std::scoped_lock lock{mutex};
         const auto it = index.find(key);
-        return it == index.end() ? std::nullopt : std::optional<Blob>{it->second};
+        if (it == index.end()) {
+            return std::nullopt;
+        }
+        std::vector<u8> payload(static_cast<size_t>(it->second.size));
+        in.clear();
+        in.seekg(static_cast<std::streamoff>(it->second.offset));
+        if (!in.read(reinterpret_cast<char*>(payload.data()),
+                     static_cast<std::streamsize>(payload.size()))) {
+            return std::nullopt;
+        }
+        return payload;
+    }
+
+    void MarkUsed(const std::string& key) {
+        std::scoped_lock lock{mutex};
+        if (const auto it = index.find(key); it != index.end()) {
+            it->second.used = true;
+        }
+    }
+
+    void Forget(const std::string& key) {
+        std::scoped_lock lock{mutex};
+        if (const auto it = index.find(key); it != index.end()) {
+            dead_bytes += RECORD_HEADER_BYTES + it->second.size;
+            index.erase(it);
+        }
     }
 
     template <typename CreateInfo, typename CreateFn>
-    bool CreateFromSaved(const Blob& blob, const CreateInfo& ci, VkPipeline* out_pipeline,
-                         CreateFn& create) {
-        if (blob.size < 4) {
+    bool CreateFromSaved(const std::vector<u8>& blob, const CreateInfo& ci,
+                         VkPipeline* out_pipeline, CreateFn& create) {
+        if (blob.size() < 4) {
             return false;
         }
         u32 count;
-        std::memcpy(&count, blob.data, 4);
+        std::memcpy(&count, blob.data(), 4);
         if (count == 0 || count > MAX_BINARIES_PER_PIPELINE) {
             return false;
         }
@@ -246,23 +300,23 @@ private:
         std::vector<VkPipelineBinaryDataKHR> datas(count);
         size_t o = 4;
         for (u32 i = 0; i < count; ++i) {
-            if (o + 4 + KEY_BYTES + 8 > blob.size) {
+            if (o + 4 + KEY_BYTES + 8 > blob.size()) {
                 return false;
             }
             keys[i] = {.sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR};
-            std::memcpy(&keys[i].keySize, blob.data + o, 4);
+            std::memcpy(&keys[i].keySize, blob.data() + o, 4);
             if (keys[i].keySize > KEY_BYTES) {
                 return false;
             }
-            std::memcpy(keys[i].key, blob.data + o + 4, KEY_BYTES);
+            std::memcpy(keys[i].key, blob.data() + o + 4, KEY_BYTES);
             u64 size;
-            std::memcpy(&size, blob.data + o + 4 + KEY_BYTES, 8);
+            std::memcpy(&size, blob.data() + o + 4 + KEY_BYTES, 8);
             o += 4 + KEY_BYTES + 8;
-            if (size > blob.size - o) {
+            if (size > blob.size() - o) {
                 return false;
             }
             datas[i] = {.dataSize = static_cast<size_t>(size),
-                        .pData = const_cast<u8*>(blob.data + o)};
+                        .pData = const_cast<u8*>(blob.data() + o)};
             o += static_cast<size_t>(size);
         }
         const VkPipelineBinaryKeysAndDataKHR keys_and_data{
@@ -360,38 +414,110 @@ private:
         if (!ok) {
             return;
         }
-        std::unique_lock lock{mutex};
-        if (index.contains(key)) {
+        std::scoped_lock lock{mutex};
+        if (index.contains(key) || !out.is_open()) {
             return;
         }
-        auto owned = std::make_unique<std::vector<u8>>(std::move(payload));
-        if (out.is_open()) {
-            const u32 magic = RECORD_MAGIC;
-            const u32 key_size = static_cast<u32>(key.size());
-            std::array<u8, KEY_BYTES> key_padded{};
-            std::memcpy(key_padded.data(), key.data(), key.size());
-            const u64 len = owned->size();
-            out.write(reinterpret_cast<const char*>(&magic), 4);
-            out.write(reinterpret_cast<const char*>(&key_size), 4);
-            out.write(reinterpret_cast<const char*>(key_padded.data()), KEY_BYTES);
-            out.write(reinterpret_cast<const char*>(&len), 8);
-            out.write(reinterpret_cast<const char*>(owned->data()),
-                      static_cast<std::streamsize>(owned->size()));
-            out.flush();
+        WriteRecord(out, key, payload.data(), payload.size());
+        out.flush();
+        if (!out) {
+            LOG_ERROR(Render_Vulkan, "Pipeline binaries: can't write {}, saving stopped",
+                      path.string());
+            out.close();
+            return;
         }
-        index.emplace(key, Blob{owned->data(), owned->size()});
-        session_blobs.push_back(std::move(owned));
+        index.emplace(key, Record{file_end + RECORD_HEADER_BYTES, payload.size(), true});
+        file_end += RECORD_HEADER_BYTES + payload.size();
         ++stats.saved;
+    }
+
+    static void WriteRecord(std::ofstream& file, const std::string& key, const u8* data,
+                            u64 size) {
+        const u32 magic = RECORD_MAGIC;
+        const u32 key_size = static_cast<u32>(key.size());
+        std::array<u8, KEY_BYTES> key_padded{};
+        std::memcpy(key_padded.data(), key.data(), key.size());
+        file.write(reinterpret_cast<const char*>(&magic), 4);
+        file.write(reinterpret_cast<const char*>(&key_size), 4);
+        file.write(reinterpret_cast<const char*>(key_padded.data()), KEY_BYTES);
+        file.write(reinterpret_cast<const char*>(&size), 8);
+        file.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size));
+    }
+
+    // Called with the mutex held and the append stream closed.
+    void Compact() {
+        const bool too_large = file_end > MAX_FILE_BYTES;
+        if (!too_large && (dead_bytes < MIN_DEAD_BYTES || dead_bytes * 4 < file_end)) {
+            return;
+        }
+        std::vector<std::pair<const std::string*, const Record*>> keep;
+        keep.reserve(index.size());
+        for (const auto& [key, record] : index) {
+            keep.emplace_back(&key, &record);
+        }
+        // Used this session first, then newest first; the file keeps its record order.
+        std::ranges::sort(keep, [](const auto& a, const auto& b) {
+            return a.second->used != b.second->used ? a.second->used
+                                                    : a.second->offset > b.second->offset;
+        });
+        u64 kept_bytes = HEADER_BYTES;
+        size_t kept = 0;
+        const u64 budget = too_large ? MAX_FILE_BYTES / 4 * 3 : ~0ULL;
+        while (kept < keep.size() &&
+               kept_bytes + RECORD_HEADER_BYTES + keep[kept].second->size <= budget) {
+            kept_bytes += RECORD_HEADER_BYTES + keep[kept].second->size;
+            ++kept;
+        }
+        keep.resize(kept);
+        std::ranges::sort(keep, {}, [](const auto& entry) { return entry.second->offset; });
+
+        auto temp = path;
+        temp += ".tmp";
+        bool ok = true;
+        {
+            std::ofstream file(temp, std::ios::binary | std::ios::trunc);
+            file.write(reinterpret_cast<const char*>(header.data()), header.size());
+            std::vector<u8> payload;
+            for (const auto& [key, record] : keep) {
+                payload.resize(static_cast<size_t>(record->size));
+                in.clear();
+                in.seekg(static_cast<std::streamoff>(record->offset));
+                if (!in.read(reinterpret_cast<char*>(payload.data()),
+                             static_cast<std::streamsize>(payload.size()))) {
+                    ok = false;
+                    break;
+                }
+                WriteRecord(file, *key, payload.data(), payload.size());
+            }
+            file.flush();
+            ok = ok && file.good();
+        }
+        in.close();
+        std::error_code ec;
+        if (ok) {
+            std::filesystem::rename(temp, path, ec);
+        }
+        if (!ok || ec) {
+            std::filesystem::remove(temp, ec);
+            LOG_WARNING(Render_Vulkan, "Pipeline binaries: can't rewrite {}, keeping it",
+                        path.string());
+            return;
+        }
+        LOG_INFO(Render_Vulkan,
+                 "Pipeline binaries: rewrote {} with {} of {} pipelines ({:.1f} of {:.1f} MiB)",
+                 path.string(), keep.size(), index.size(), Mib(kept_bytes), Mib(file_end));
     }
 
     VkDevice device{};
     const vk::DeviceDispatch* dld{};
     std::filesystem::path path;
+    std::array<u8, HEADER_BYTES> header{};
     std::ofstream out;
-    std::vector<u8> loaded;
-    std::vector<std::unique_ptr<std::vector<u8>>> session_blobs;
-    std::unordered_map<std::string, Blob> index;
-    std::shared_mutex mutex;
+    std::ifstream in;
+    u64 file_end{};
+    u64 dead_bytes{};
+    std::unordered_map<std::string, Record> index;
+    std::mutex mutex;
     Stats stats;
 };
 
