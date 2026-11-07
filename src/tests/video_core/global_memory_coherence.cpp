@@ -384,50 +384,59 @@ TEST_CASE("Global fallback backends address sparse guest slots through compact b
     }
 }
 
-TEST_CASE("SPIR-V global memory helpers are emitted as DontInline functions",
+TEST_CASE("SPIR-V global memory helpers are DontInline in compute only",
           "[video_core][spirv][global_memory]") {
-    Program fixture;
-    auto& info = fixture.program.info;
-    info.used_storage_buffer_types = IR::Type::U32;
-    info.storage_buffers_descriptors = {{0, 0x340, 1, true}, {0, 0x400, 1, true}};
-    info.uses_global_memory = true;
-    info.uses_int64 = true;
-    info.stores_global_memory = true;
-    info.constant_buffer_descriptors = {{0, 1}};
-    info.used_constant_buffer_types = IR::Type::U32x2;
-    info.uses_local_invocation_id = true;
-    fixture.profile.support_int64 = true;
-    fixture.profile.support_descriptor_aliasing = true;
-    IR::IREmitter ir{fixture.block};
-    const auto address =
-        ir.PackUint2x32(ir.CompositeConstruct(ir.LocalInvocationIdX(), ir.Imm32(0)));
-    ir.WriteGlobal32(address, ir.LoadGlobal32(address));
+    for (const Stage stage : {Stage::Compute, Stage::VertexB, Stage::Fragment, Stage::Mesh}) {
+        CAPTURE(stage);
+        Program fixture;
+        fixture.program.stage = stage;
+        if (stage == Stage::Mesh) {
+            fixture.program.mesh.max_vertices = 32;
+            fixture.program.mesh.max_primitives = 1;
+            fixture.program.mesh.topology = 4;
+        }
+        auto& info = fixture.program.info;
+        info.used_storage_buffer_types = IR::Type::U32;
+        info.storage_buffers_descriptors = {{0, 0x340, 1, true}, {0, 0x400, 1, true}};
+        info.uses_global_memory = true;
+        info.uses_int64 = true;
+        info.stores_global_memory = true;
+        info.constant_buffer_descriptors = {{0, 1}};
+        info.used_constant_buffer_types = IR::Type::U32 | IR::Type::U32x2;
+        fixture.profile.support_int64 = true;
+        fixture.profile.support_descriptor_aliasing = true;
+        IR::IREmitter ir{fixture.block};
+        const auto address = ir.PackUint2x32(
+            ir.CompositeConstruct(ir.GetCbuf(ir.Imm32(0), ir.Imm32(0x10)), ir.Imm32(0)));
+        ir.WriteGlobal32(address, ir.LoadGlobal32(address));
 
-    const auto code = Backend::SPIRV::EmitSPIRV(fixture.profile, fixture.program);
-    constexpr u32 OpEntryPoint = 15;
-    constexpr u32 OpFunction = 54;
-    constexpr u32 OpFunctionCall = 57;
-    constexpr u32 DontInline = 0x2;
-    std::map<u32, u32> controls;
-    for (const auto& op : Instructions(code, OpFunction)) {
-        REQUIRE(op.size() == 4);
-        controls[op[1]] = op[2];
-    }
-    const auto entry_points = Instructions(code, OpEntryPoint);
-    REQUIRE(entry_points.size() == 1);
-    REQUIRE(controls.contains(entry_points[0][1]));
-    CHECK((controls.at(entry_points[0][1]) & DontInline) == 0);
+        const auto code = Backend::SPIRV::EmitSPIRV(fixture.profile, fixture.program);
+        constexpr u32 OpEntryPoint = 15;
+        constexpr u32 OpFunction = 54;
+        constexpr u32 OpFunctionCall = 57;
+        constexpr u32 DontInline = 0x2;
+        std::map<u32, u32> controls;
+        for (const auto& op : Instructions(code, OpFunction)) {
+            REQUIRE(op.size() == 4);
+            controls[op[1]] = op[2];
+        }
+        const auto entry_points = Instructions(code, OpEntryPoint);
+        REQUIRE(entry_points.size() == 1);
+        REQUIRE(controls.contains(entry_points[0][1]));
+        CHECK((controls.at(entry_points[0][1]) & DontInline) == 0);
 
-    std::set<u32> callees;
-    for (const auto& op : Instructions(code, OpFunctionCall)) {
-        REQUIRE(op.size() >= 3);
-        callees.insert(op[2]);
-    }
-    REQUIRE(callees.size() == 2);
-    for (const u32 callee : callees) {
-        CAPTURE(callee);
-        REQUIRE(controls.contains(callee));
-        CHECK((controls.at(callee) & DontInline) != 0);
+        std::set<u32> callees;
+        for (const auto& op : Instructions(code, OpFunctionCall)) {
+            REQUIRE(op.size() >= 3);
+            callees.insert(op[2]);
+        }
+        REQUIRE(callees.size() == 2);
+        const u32 expected = stage == Stage::Compute ? DontInline : 0;
+        for (const u32 callee : callees) {
+            CAPTURE(callee);
+            REQUIRE(controls.contains(callee));
+            CHECK((controls.at(callee) & DontInline) == expected);
+        }
     }
 }
 
