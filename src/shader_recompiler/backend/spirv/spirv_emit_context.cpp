@@ -974,8 +974,12 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
     }
     using DefPtr = Id StorageDefinitions::*;
     // Each helper scans every global storage buffer. Inlined at every call site, a compute shader
-    // with many global accesses takes NVIDIA's compiler seconds (Ocarina of Time: up to 7.6 s each).
-    constexpr spv::FunctionControlMask function_control = spv::FunctionControlMask::DontInline;
+    // with many global accesses takes NVIDIA's compiler seconds (Ocarina of Time: up to 7.6 s each),
+    // so compute keeps them DontInline. Other stages inline them: with DontInline, NVIDIA 580.x let
+    // a second helper call clobber the first call's live result in a mesh shader.
+    const spv::FunctionControlMask function_control = stage == Stage::Compute
+                                                          ? spv::FunctionControlMask::DontInline
+                                                          : spv::FunctionControlMask::MaskNone;
     const Id zero{u32_zero_value};
     const auto define_body{[&](DefPtr ssbo_member, Id addr, Id element_pointer, u32 shift,
                                auto&& callback) {
