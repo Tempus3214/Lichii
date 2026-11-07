@@ -8,6 +8,7 @@
 
 #include <array>
 #include <exception>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -347,6 +348,11 @@ struct DeviceDispatch : InstanceDispatch {
 #endif
     PFN_vkGetDeviceFaultInfoEXT vkGetDeviceFaultInfoEXT{};
     PFN_vkGetPipelineExecutablePropertiesKHR vkGetPipelineExecutablePropertiesKHR{};
+    PFN_vkGetPipelineKeyKHR vkGetPipelineKeyKHR{};
+    PFN_vkCreatePipelineBinariesKHR vkCreatePipelineBinariesKHR{};
+    PFN_vkDestroyPipelineBinaryKHR vkDestroyPipelineBinaryKHR{};
+    PFN_vkGetPipelineBinaryDataKHR vkGetPipelineBinaryDataKHR{};
+    PFN_vkReleaseCapturedPipelineDataKHR vkReleaseCapturedPipelineDataKHR{};
     PFN_vkGetPipelineExecutableStatisticsKHR vkGetPipelineExecutableStatisticsKHR{};
     PFN_vkGetQueryPoolResults vkGetQueryPoolResults{};
     PFN_vkGetSemaphoreCounterValue vkGetSemaphoreCounterValue{};
@@ -1061,6 +1067,12 @@ public:
 };
 
 class Device : public Handle<VkDevice, NoOwner, DeviceDispatch> {
+public:
+    /// Saves and reuses the driver's compiled pipelines in this file (VK_KHR_pipeline_binary).
+    void EnablePipelineBinaryCache(const std::filesystem::path& file) const;
+    /// Stops it; later pipelines are compiled normally.
+    void DisablePipelineBinaryCache() const;
+
     using Handle<VkDevice, NoOwner, DeviceDispatch>::Handle;
 
 public:

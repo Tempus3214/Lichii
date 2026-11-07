@@ -765,6 +765,9 @@ PipelineCache::~PipelineCache() {
     }
     graphics_cache.clear();
     evicted_pipelines.clear();
+    if (pipeline_binaries_enabled) {
+        device.GetLogical().DisablePipelineBinaryCache();
+    }
 }
 
 void PipelineCache::SaveUsedPipelines() {
@@ -986,6 +989,15 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan", CACHE_VERSION);
     used_pipelines_filename =
         VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_used", CACHE_VERSION);
+    // NVIDIA's driver already keeps every pipeline in its own disk cache, so saving binaries
+    // there would only duplicate it.
+    if (Settings::values.use_vulkan_pipeline_binaries.GetValue() &&
+        device.IsKhrPipelineBinarySupported() &&
+        device.GetDriverID() != VK_DRIVER_ID_NVIDIA_PROPRIETARY) {
+        device.GetLogical().EnablePipelineBinaryCache(
+            VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_binaries", CACHE_VERSION));
+        pipeline_binaries_enabled = true;
+    }
     constexpr std::array<char, 8> shader_magic{'y', 'u', 'z', 'u', 'c', 'a', 'c', 'h'};
     // Versions 52 and 53 store the same records; only translation output changed since, and it is
     // rebuilt at load. The newest one present is copied.
@@ -1002,6 +1014,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     used_pipelines = LoadUsedPipelines(used_pipelines_filename, MaxUsedPipelineAge(device));
     used_pipelines_saved = std::chrono::steady_clock::now();
     size_t skipped_pipelines = 0;
+    size_t foreign_driver_pipelines = 0;
     size_t deferred_pipelines = 0;
     size_t queued_graphics = 0;
     using GraphicsRecords = std::vector<std::vector<FileEnvironment>>;
@@ -1069,6 +1082,18 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     const auto load_graphics{[&](std::ifstream& file, std::vector<FileEnvironment> envs) {
         GraphicsPipelineCacheKey key;
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
+        if (key.state.driver_id != dynamic_features.driver_id ||
+            key.state.driver_version != dynamic_features.driver_version) {
+            // Pipelines from a cache made with another driver (a shared shader pack) are
+            // recompiled from their guest shaders like any other cached pipeline; only the driver
+            // fields of the key say where they came from.
+            key.state.driver_id = dynamic_features.driver_id;
+            key.state.driver_version = dynamic_features.driver_version;
+            if (!dynamic_features.has_extended_dynamic_state_2_logic_op) {
+                key.state.extended_dynamic_state_2_logic_op.Assign(0);
+            }
+            ++foreign_driver_pipelines;
+        }
 
         if (!device.IsExtMeshShaderSupported() &&
             std::ranges::any_of(envs, [](const FileEnvironment& env) {
@@ -1194,6 +1219,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     compute_envs.clear();
 
     LOG_INFO(Render_Vulkan, "Total Pipeline Count: {}", state.total);
+    if (foreign_driver_pipelines != 0) {
+        LOG_INFO(Render_Vulkan, "{} cached graphics pipelines came from another driver",
+                 foreign_driver_pipelines);
+    }
     if (skipped_pipelines != 0) {
         LOG_INFO(
             Render_Vulkan,

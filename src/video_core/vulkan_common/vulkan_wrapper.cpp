@@ -14,6 +14,7 @@
 #include "common/logging.h"
 #include "video_core/vulkan_common/vk_enum_string_helper.h"
 #include "video_core/vulkan_common/vma.h"
+#include "video_core/vulkan_common/vulkan_pipeline_binary_cache.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace Vulkan::vk {
@@ -230,6 +231,11 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkGetQueryPoolResults);
     X(vkGetDeviceFaultInfoEXT);
     X(vkGetPipelineExecutablePropertiesKHR);
+    X(vkGetPipelineKeyKHR);
+    X(vkCreatePipelineBinariesKHR);
+    X(vkDestroyPipelineBinaryKHR);
+    X(vkGetPipelineBinaryDataKHR);
+    X(vkReleaseCapturedPipelineDataKHR);
     X(vkGetPipelineExecutableStatisticsKHR);
     X(vkGetSemaphoreCounterValue);
     X(vkMapMemory);
@@ -776,7 +782,10 @@ PipelineLayout Device::CreatePipelineLayout(const VkPipelineLayoutCreateInfo& ci
 
 Pipeline Device::CreateGraphicsPipeline(const VkGraphicsPipelineCreateInfo& ci, VkPipelineCache cache) const {
     VkPipeline object = VK_NULL_HANDLE;
-    auto const result = dld->vkCreateGraphicsPipelines(handle, cache, 1, &ci, nullptr, &object);
+    VkResult result;
+    if (!PipelineBinaryCache::CreateGraphicsPipeline(handle, *dld, ci, cache, &object, &result)) {
+        result = dld->vkCreateGraphicsPipelines(handle, cache, 1, &ci, nullptr, &object);
+    }
     // Adreno 5xx drivers do not properly return when a graphics pipeline fails to be created
     // Some (unkown) Mali drivers also do not properly return
     // This result code is out of spec, but should be handled as "kinda working"
@@ -788,9 +797,21 @@ Pipeline Device::CreateGraphicsPipeline(const VkGraphicsPipelineCreateInfo& ci, 
 
 Pipeline Device::CreateComputePipeline(const VkComputePipelineCreateInfo& ci,
                                        VkPipelineCache cache) const {
-    VkPipeline object;
-    Check(dld->vkCreateComputePipelines(handle, cache, 1, &ci, nullptr, &object));
+    VkPipeline object = VK_NULL_HANDLE;
+    VkResult result;
+    if (!PipelineBinaryCache::CreateComputePipeline(handle, *dld, ci, cache, &object, &result)) {
+        result = dld->vkCreateComputePipelines(handle, cache, 1, &ci, nullptr, &object);
+    }
+    Check(result);
     return Pipeline(object, handle, *dld);
+}
+
+void Device::EnablePipelineBinaryCache(const std::filesystem::path& file) const {
+    PipelineBinaryCache::Activate(handle, *dld, file);
+}
+
+void Device::DisablePipelineBinaryCache() const {
+    PipelineBinaryCache::Deactivate();
 }
 
 Sampler Device::CreateSampler(const VkSamplerCreateInfo& ci) const {

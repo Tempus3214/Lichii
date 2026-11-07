@@ -1835,6 +1835,12 @@ void Device::RemoveUnsuitableExtensions() {
     RemoveExtensionFeatureIfUnsuitable(extensions.maintenance5, features.maintenance5,
                                        VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
 
+    // VK_KHR_pipeline_binary (needs maintenance5 for the capture flag)
+    extensions.pipeline_binary =
+        features.pipeline_binary.pipelineBinaries && extensions.maintenance5;
+    RemoveExtensionFeatureIfUnsuitable(extensions.pipeline_binary, features.pipeline_binary,
+                                       VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
+
     // VK_KHR_maintenance6
     extensions.maintenance6 = features.maintenance6.maintenance6;
     RemoveExtensionFeatureIfUnsuitable(extensions.maintenance6, features.maintenance6,

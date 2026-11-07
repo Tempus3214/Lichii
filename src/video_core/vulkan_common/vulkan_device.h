@@ -80,6 +80,7 @@ VK_DEFINE_HANDLE(VmaPool)
     FEATURE(KHR, CooperativeMatrix, COOPERATIVE_MATRIX, cooperative_matrix)                        \
     FEATURE(KHR, Maintenance5, MAINTENANCE_5, maintenance5)                                        \
     FEATURE(KHR, Maintenance6, MAINTENANCE_6, maintenance6)                                        \
+    FEATURE(KHR, PipelineBinary, PIPELINE_BINARY, pipeline_binary)                                 \
     FEATURE(KHR, PipelineExecutableProperties, PIPELINE_EXECUTABLE_PROPERTIES,                     \
             pipeline_executable_properties)                                                        \
     FEATURE(KHR, ShaderQuadControl, SHADER_QUAD_CONTROL, shader_quad_control)                      \
@@ -1194,6 +1195,11 @@ FN_MAX_LIMIT_LIST
     /// Returns true if the device supports VK_KHR_maintenance4.
     bool IsKhrMaintenance4Supported() const {
         return extensions.maintenance4;
+    }
+
+    /// Returns true if VK_KHR_pipeline_binary is enabled (compiled pipelines can be saved).
+    bool IsKhrPipelineBinarySupported() const {
+        return extensions.pipeline_binary;
     }
 
     /// Returns true if the device supports VK_KHR_maintenance5.

@@ -260,6 +260,8 @@ add_library(video_core STATIC
     vulkan_common/vulkan_memory_allocator.h
     vulkan_common/vulkan_surface.cpp
     vulkan_common/vulkan_surface.h
+    vulkan_common/vulkan_pipeline_binary_cache.cpp
+    vulkan_common/vulkan_pipeline_binary_cache.h
     vulkan_common/vulkan_wrapper.cpp
     vulkan_common/vulkan_wrapper.h
     vulkan_common/nsight_aftermath_tracker.cpp

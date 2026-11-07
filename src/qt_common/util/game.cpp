@@ -275,6 +275,12 @@ void RemoveVulkanDriverPipelineCache(u64 program_id) {
     const auto shader_cache_folder_path = shader_cache_dir / fmt::format("{:016x}", program_id);
     const auto target_file = VideoCommon::VersionedPipelineCachePath(
         shader_cache_folder_path, "vulkan_pipelines", VideoCommon::VulkanPipelineCacheVersion);
+    const auto binaries_file = VideoCommon::VersionedPipelineCachePath(
+        shader_cache_folder_path, "vulkan_binaries", VideoCommon::VulkanPipelineCacheVersion);
+    if (Common::FS::Exists(binaries_file) && !Common::FS::RemoveFile(binaries_file)) {
+        QtCommon::Frontend::Warning(tr("Error Removing Vulkan Driver Pipeline Cache"),
+                                    tr("Failed to remove the saved compiled shaders."));
+    }
 
     if (!Common::FS::Exists(target_file)) {
         return;

@@ -236,6 +236,7 @@ private:
     VideoCore::ShaderNotify& shader_notify;
     bool use_asynchronous_shaders{};
     bool use_vulkan_pipeline_cache{};
+    bool pipeline_binaries_enabled{};
     const size_t num_pipeline_workers;
     EmissionBudget emission_budget;
 
