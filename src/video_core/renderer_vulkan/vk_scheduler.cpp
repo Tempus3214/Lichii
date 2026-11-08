@@ -968,7 +968,8 @@ void Scheduler::EndRenderPass()
         Record([num_images = num_renderpass_images,
                        images = renderpass_images,
                        ranges = renderpass_image_ranges,
-                       has_transform_feedback = device.IsExtTransformFeedbackSupported()](
+                       has_transform_feedback = device.IsExtTransformFeedbackSupported(),
+                       wfi_stages = std::exchange(wfi_pending_stages, VkPipelineStageFlags{})](
                           vk::CommandBuffer cmdbuf) {
             std::array<VkImageMemoryBarrier, 9> barriers;
             for (size_t i = 0; i < num_images; ++i) {
@@ -1019,6 +1020,20 @@ void Scheduler::EndRenderPass()
                 cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFORM_FEEDBACK_BIT_EXT,
                                        VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                                        0, XFB_OUTPUT_BARRIER);
+            }
+            if (wfi_stages != 0) {
+                // A deferred guest wait-for-idle (DeferWaitForIdle): the same barrier
+                // RasterizerVulkan::WaitForIdle records outside a render pass.
+                static constexpr VkMemoryBarrier WFI_BARRIER{
+                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                };
+                cmdbuf.PipelineBarrier(wfi_stages | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                                           VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                       VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, WFI_BARRIER);
             }
         });
 

@@ -129,6 +129,15 @@ public:
         return fragment_barrier.Pending();
     }
 
+    /// A guest wait-for-idle inside a render pass: instead of ending the pass now, the next draw
+    /// ends it only if it reads what the pass wrote (as for DeferFragmentBarrier), and the full
+    /// wait-for-idle barrier is recorded whenever the pass ends, before any work outside it.
+    /// Ending the pass costs a cache flush (and may decompress render targets) on AMD.
+    void DeferWaitForIdle(VkPipelineStageFlags src_stages) {
+        fragment_barrier.Defer(true);
+        wfi_pending_stages |= src_stages;
+    }
+
     void NoteRenderPassStores() {
         render_pass_has_stores = true;
     }
@@ -449,6 +458,7 @@ private:
 
     std::unique_ptr<MasterSemaphore> master_semaphore;
     FragmentBarrierState fragment_barrier;
+    VkPipelineStageFlags wfi_pending_stages{}; ///< DeferWaitForIdle stages, recorded at pass end
     bool render_pass_has_stores{};
     bool compute_writes_pending{};
     bool graphics_pipeline_missing{};
