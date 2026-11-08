@@ -2343,6 +2343,22 @@ void RasterizerVulkan::WaitForIdle() {
         fence_manager.SignalOrdering();
         return;
     }
+    // Ocarina issues ~800 wait-for-idles a second, most inside a render pass. Ending the pass for
+    // each one flushes caches on AMD. Defer it: the next draw ends the pass only if it reads what
+    // the pass wrote (storage stores, or a sampled render target), and the barrier itself is
+    // recorded when the pass ends, before any copy, dispatch, query or submission.
+    // Transform feedback writes buffers that later draws read as vertices, so it keeps the old
+    // path. EDEN_NX2_DEFER_WFI=0 restores the old path everywhere.
+    static const bool defer_wfi = [] {
+        const char* value = std::getenv("EDEN_NX2_DEFER_WFI");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (defer_wfi && scheduler.IsRenderPassActive() && maxwell3d != nullptr &&
+        maxwell3d->regs.transform_feedback_enabled == 0) {
+        scheduler.DeferWaitForIdle(flags);
+        fence_manager.SignalOrdering();
+        return;
+    }
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record([flags](vk::CommandBuffer cmdbuf) {
         // Later work waits for the earlier work and sees its writes.
