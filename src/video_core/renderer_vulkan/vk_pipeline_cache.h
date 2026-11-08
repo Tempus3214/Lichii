@@ -238,6 +238,9 @@ private:
     std::atomic_bool flush_in_flight{};
 
     Common::ThreadWorker workers;
+    /// Software HMMA compute pipelines on drivers that take minutes on them
+    /// (Device::DefersSoftwareMatrixPipelines); nothing waits for this worker.
+    Common::ThreadWorker deferred_workers;
     Common::ThreadWorker serialization_thread;
     DynamicFeatures dynamic_features;
     PipelinePrebuild<GraphicsPipelineCacheKey, GraphicsPipeline> background_pipelines;
