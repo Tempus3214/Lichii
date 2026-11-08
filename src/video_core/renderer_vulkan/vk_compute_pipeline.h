@@ -109,6 +109,8 @@ private:
     u64 shader_hash{};
     /// Built on a worker nothing waits for: dispatches are skipped until the pipeline exists.
     bool skip_until_built{};
+    /// GPU thread only: the first dispatch already waited its short budget for the build.
+    bool first_use_waited{};
     u32 num_descriptor_entries{};
     boost::container::small_vector<VideoCommon::ImageViewId, 8> written_images;
     std::vector<SampledImage> sampled_images;

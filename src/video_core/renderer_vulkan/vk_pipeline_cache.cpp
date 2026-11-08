@@ -2395,13 +2395,25 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     }
     const bool deferred = program.info.uses_software_matrix &&
                           device.DefersSoftwareMatrixPipelines();
+    // Compute pipelines met during play (build_in_parallel; the disk cache loads with false) are
+    // otherwise waited for on the scheduler thread: AMD's compiler takes seconds on some of
+    // Ocarina's, freezing the game. With asynchronous shaders on, build them on the workers and
+    // skip their dispatches after a short first wait, as Bounded does for draws.
+    // EDEN_NX2_ASYNC_COMPUTE=0 waits as before.
+    static const bool async_compute_switch = [] {
+        const char* value = std::getenv("EDEN_NX2_ASYNC_COMPUTE");
+        return value == nullptr || value[0] != '0';
+    }();
+    const bool async_compute = !deferred && build_in_parallel && async_compute_switch &&
+                               device.DefersSoftwareMatrixPipelines() &&
+                               Settings::values.use_asynchronous_shaders.GetValue();
     Common::ThreadWorker* const thread_worker{deferred            ? &deferred_workers
                                               : build_in_parallel ? &workers
                                                                   : nullptr};
     return {.pipeline = std::make_unique<ComputePipeline>(
                 device, scheduler, vulkan_pipeline_cache, descriptor_pool, guest_descriptor_queue,
                 descriptor_buffer_ring, thread_worker, statistics, &shader_notify, program.info,
-                std::move(spv_module), key.unique_hash),
+                std::move(spv_module), key.unique_hash, deferred || async_compute),
             .null_pointer_slots = env.IsNativeProgram() ? env.NullStoragePointerSlots()
                                                         : std::vector<std::pair<u32, u32>>{},
             .mapped_pointers =
