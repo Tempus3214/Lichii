@@ -6,6 +6,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <chrono>
+#include <unordered_map>
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -494,9 +496,57 @@ struct Memory::Impl {
         }
     }
 
+    // EDEN_NX2_MME_DMA_STATS: how often pages are protected again after an upload and
+    // unprotected by a CPU write, and how many distinct pages that is.
+    struct ProtectStats {
+        std::mutex mutex;
+        std::array<u64, 2> calls{};
+        std::array<u64, 2> pages{};
+        std::unordered_map<u64, u32> protected_pages;
+        std::chrono::steady_clock::time_point last_log{std::chrono::steady_clock::now()};
+
+        static ProtectStats* Get() {
+            static const bool enabled = std::getenv("EDEN_NX2_MME_DMA_STATS") != nullptr;
+            static ProtectStats stats;
+            return enabled ? &stats : nullptr;
+        }
+
+        void Note(u64 vaddr, u64 size, bool cached) {
+            std::scoped_lock lk{mutex};
+            const u64 first = vaddr >> YUZU_PAGEBITS;
+            const u64 last = (vaddr + size - 1) >> YUZU_PAGEBITS;
+            ++calls[cached];
+            pages[cached] += last - first + 1;
+            if (cached) {
+                for (u64 page = first; page <= last; ++page) {
+                    ++protected_pages[page];
+                }
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_log < std::chrono::seconds{5}) {
+                return;
+            }
+            last_log = now;
+            size_t hot = 0;
+            for (const auto& [page, count] : protected_pages) {
+                hot += count >= 100 ? 1 : 0;
+            }
+            LOG_INFO(HW_Memory,
+                     "Page protection (5 s): protect {} calls {} pages ({} distinct, {} protected "
+                     "100+ times), unprotect {} calls {} pages",
+                     calls[1], pages[1], protected_pages.size(), hot, calls[0], pages[0]);
+            calls = {};
+            pages = {};
+            protected_pages.clear();
+        }
+    };
+
     void RasterizerMarkRegionCached(u64 vaddr, u64 size, bool cached) {
         if (vaddr == 0 || !AddressSpaceContains(*current_page_table, vaddr, size)) {
             return;
+        }
+        if (auto* stats = ProtectStats::Get()) {
+            stats->Note(vaddr, size, cached);
         }
 
         if (current_page_table->fastmem_arena) {

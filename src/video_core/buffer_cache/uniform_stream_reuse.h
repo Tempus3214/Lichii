@@ -97,8 +97,17 @@ template <class Runtime, class DeviceMemory>
     }
     Reuse& reuse = UniformStreamReuseState<typename Runtime::StreamUniformRef>();
     typename Reuse::Slot& slot = reuse.slots[stage][index];
-    u8* const scratch = reuse.scratch.data();
-    device_memory.ReadBlockUnsafe(device_addr, scratch, size);
+    // Within one device page the guest bytes are contiguous: use them in place instead of
+    // copying them to the scratch first.
+    constexpr u64 PageMask = (u64{1} << 12) - 1;
+    const u8* scratch = nullptr;
+    if ((device_addr & PageMask) + size <= PageMask + 1) {
+        scratch = device_memory.template GetPointer<u8>(device_addr);
+    }
+    if (scratch == nullptr) {
+        device_memory.ReadBlockUnsafe(device_addr, reuse.scratch.data(), size);
+        scratch = reuse.scratch.data();
+    }
 
     const bool same_bytes =
         slot.size == size && std::memcmp(slot.bytes.data(), scratch, size) == 0;
@@ -106,15 +115,17 @@ template <class Runtime, class DeviceMemory>
         runtime.RebindStreamUniform(slot.ref, size);
         return true;
     }
-    const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
-    std::memcpy(span.data(), scratch, size);
-    slot.ref = runtime.LastStreamUniformRef();
-    // After the allocation: the tick the stream region is tagged with is the one current now.
-    slot.tick = runtime.CurrentTick();
+    // Upload the slot's copy: guest memory may change while this runs, and a later reuse must
+    // find exactly the bytes that were uploaded.
     if (!same_bytes) {
         slot.size = size;
         std::memcpy(slot.bytes.data(), scratch, size);
     }
+    const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
+    std::memcpy(span.data(), slot.bytes.data(), size);
+    slot.ref = runtime.LastStreamUniformRef();
+    // After the allocation: the tick the stream region is tagged with is the one current now.
+    slot.tick = runtime.CurrentTick();
     return true;
 }
 

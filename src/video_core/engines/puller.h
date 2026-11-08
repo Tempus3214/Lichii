@@ -7,9 +7,12 @@
 #pragma once
 
 #include <array>
+#include <atomic>
+#include <mutex>
 #include <chrono>
 #include <cstddef>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 #include "common/bit_field.h"
 #include "common/common_funcs.h"
@@ -149,6 +152,21 @@ private:
     [[nodiscard]] bool ExecuteMethodOnEngine(DmaPusher& dma_pusher, u32 method);
 
     std::optional<PendingAcquire> pending_acquire;
+    /// Semaphore releases this channel queued for the split's back: payload and ring position.
+    struct QueuedRelease {
+        u32 payload;
+        u64 position;
+    };
+    std::unordered_map<GPUVAddr, QueuedRelease> queued_releases;
+    /// GpuSplit::Epoch when queued_releases was filled: a restarted split voids its positions.
+    u64 queued_releases_epoch{};
+    void CheckReleaseEpoch();
+    /// Whether no queued write or undownloaded GPU write can change the semaphore at `address`.
+    bool StableSemaphore(DmaPusher& dma_pusher, GPUVAddr address);
+    void NoteRelease(GPUVAddr address, u32 payload);
+    /// The payload of this channel's queued release at `address`, if it is still queued and is
+    /// the last write to it before what is sent now.
+    std::optional<u32> OwnQueuedRelease(DmaPusher& dma_pusher, GPUVAddr address);
 
     /// Mapping of command subchannels to their bound engine ids
     std::array<EngineID, 8> bound_engines{};

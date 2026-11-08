@@ -124,6 +124,57 @@ void GpuSplit::MaybeStart(Core::System& system_) {
              front_macros ? ", macros on the first" : "");
 }
 
+namespace {
+constexpr u64 PageShift = 12;
+
+// The key of a 64-byte block: its device address, or its GPU address in `space` while unmapped.
+template <typename Func>
+void ForEachBlockKey(const void* space, u64 begin, u64 end, u64 block_shift, Func&& func) {
+    const auto* memory_manager = static_cast<const Tegra::MemoryManager*>(space);
+    const u64 per_page = u64{1} << (PageShift - block_shift);
+    u64 block = begin >> block_shift;
+    const u64 last = (end - 1) >> block_shift;
+    while (block <= last) {
+        const u64 page = block >> (PageShift - block_shift);
+        const u64 page_last = std::min(last, (page + 1) * per_page - 1);
+        const auto device = memory_manager->GpuToCpuAddress(page << PageShift);
+        for (; block <= page_last; ++block) {
+            const u64 offset = block & (per_page - 1);
+            func(device ? ((*device >> block_shift) | offset) & ~(u64{1} << 63)
+                        : (block ^ (static_cast<u64>(reinterpret_cast<uintptr_t>(space)) << 40)) |
+                              (u64{1} << 63));
+        }
+    }
+}
+} // Anonymous namespace
+
+void GpuSplit::NoteBlocks(std::unordered_map<u64, u64>& blocks, const void* space, u64 begin,
+                          u64 end) {
+    ForEachBlockKey(space, begin, end, WriteBlockShift,
+                    [&](u64 key) { blocks[key] = write_position; });
+}
+
+u64 GpuSplit::BlocksPosition(const std::unordered_map<u64, u64>& blocks, const void* space,
+                             u64 begin, u64 end) const {
+    u64 position = 0;
+    ForEachBlockKey(space, begin, end, WriteBlockShift, [&](u64 key) {
+        if (const auto it = blocks.find(key); it != blocks.end()) {
+            position = std::max(position, it->second);
+        }
+    });
+    return position;
+}
+
+u64 GpuSplit::TrackedWritePosition(const void* space, u64 begin, u64 end) {
+    if (end <= begin || write_blocks.empty() || latest_block_write <= Consumed()) {
+        return 0;
+    }
+    if (((end - 1) >> WriteBlockShift) - (begin >> WriteBlockShift) >= MaxWriteBlocks) {
+        return latest_block_write;
+    }
+    return BlocksPosition(write_blocks, space, begin, end);
+}
+
 void GpuSplit::Stop() {
     if (!back_thread.joinable()) {
         return;
@@ -140,6 +191,14 @@ void GpuSplit::Stop() {
     ring.reset();
     write_position = 0;
     last_writer_position = 0;
+    last_barrier_position = 0;
+    draws_queued = false;
+    ++epoch;
+    write_blocks.clear();
+    opaque_blocks.clear();
+    front_words.clear();
+    latest_block_write = 0;
+    latest_opaque_write = 0;
     last_sync_position = 0;
     published_local = 0;
     consumed_cache = 0;

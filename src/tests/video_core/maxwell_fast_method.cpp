@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <functional>
@@ -12,6 +13,7 @@
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include "common/page_table.h"
 #include "common/scope_exit.h"
@@ -836,4 +838,86 @@ TEST_CASE("Maxwell3D's split front uploads macro code sent as one multi-method r
     const auto& macros = engine.GetNativeMacroEngine();
     REQUIRE(macros.native_write_offset == pointer * 3 + code.size());
     CHECK(std::equal(code.begin(), code.end(), macros.native_code.begin() + pointer * 3));
+}
+
+TEST_CASE("Split front orders queued draws before reads at the next wait for idle",
+          "[video_core][gpu_split_dependencies]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    constexpr u32 WaitForIdle = MAXWELL3D_REG_INDEX(wait_for_idle);
+    constexpr GPUVAddr address = 0x100000;
+    // Instance id in draw.begin bits 26-27: a plain draw, or the first draw of an instanced
+    // loop that the back defers until the wait for idle flushes it.
+    const u32 begin = GENERATE(0u, 1u << 26);
+    CAPTURE(begin);
+    Fixture f;
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system);
+    auto& engine = f.fast;
+    const auto ready = [&] { return split.ReadReadyPosition(&f.memory, address, address + 4); };
+
+    // A wait for idle without draws orders nothing.
+    engine.FrontCallMethod(f.system, split, WaitForIdle, 0, true);
+    REQUIRE(ready() == 0);
+    // The back has executed nothing, so nothing has told the front this draw writes memory.
+    engine.FrontCallMethod(f.system, split, DrawBegin, begin, true);
+    engine.FrontCallMethod(f.system, split, DrawEnd, 0, true);
+    // Hardware orders macro reads after draws only across a wait for idle.
+    REQUIRE(ready() == 0);
+    engine.FrontCallMethod(f.system, split, WaitForIdle, 0, true);
+    REQUIRE(ready() == Access::End(split));
+    REQUIRE(split.WriterPosition() == Access::End(split));
+    // Recorded once: a second wait for idle does not move it.
+    const u64 after_draw = Access::End(split);
+    engine.FrontCallMethod(f.system, split, WaitForIdle, 0, true);
+    REQUIRE(ready() == after_draw);
+}
+
+TEST_CASE("Split host syncs order queued draws as waits for idle do",
+          "[video_core][gpu_split_dependencies]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system);
+    split.NoteSync();
+    REQUIRE(split.WriterPosition() == 0);
+    f.fast.FrontCallMethod(f.system, split, DrawBegin, 0, true);
+    f.fast.FrontCallMethod(f.system, split, DrawEnd, 0, true);
+    REQUIRE(split.WriterPosition() == 0);
+    split.NoteSync();
+    REQUIRE(split.WriterPosition() == Access::End(split));
+}
+
+TEST_CASE("Split front read after a draw and a wait for idle waits for a delayed back",
+          "[video_core][gpu_split_dependencies]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    constexpr GPUVAddr address = 0x100000;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    Access::Start(split, f.system);
+    SCOPE_EXIT { split.Stop(); };
+    auto& engine = f.fast;
+    // The front drains once as it starts: start it before the back stalls.
+    engine.FrontCallMethod(f.system, split, f.state_methods.front(), 0x1234, true);
+    std::atomic<bool> release{false};
+    std::atomic<bool> drawn{false};
+    // The back stalls before the first draw it executes, as it can behind real work.
+    split.Defer([&release] {
+        while (!release.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    });
+    engine.FrontCallMethod(f.system, split, DrawBegin, 0, true);
+    engine.FrontCallMethod(f.system, split, DrawEnd, 0, true);
+    // Stands for the draw's shader stores.
+    split.Defer([&drawn] { drawn.store(true, std::memory_order_release); });
+    engine.FrontCallMethod(f.system, split, MAXWELL3D_REG_INDEX(wait_for_idle), 0, true);
+    const u64 target = split.ReadReadyPosition(&f.memory, address, address + 4);
+    REQUIRE(target > split.Consumed());
+    std::jthread releaser([&release] {
+        std::this_thread::sleep_for(std::chrono::milliseconds{20});
+        release.store(true, std::memory_order_release);
+    });
+    split.WaitForPosition(target, VideoCommon::DrainSite::MacroDmaRead);
+    REQUIRE(drawn.load(std::memory_order_acquire));
 }
