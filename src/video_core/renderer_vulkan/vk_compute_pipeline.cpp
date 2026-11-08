@@ -316,7 +316,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
                          shader_hash, build_seconds(), exception.what());
             std::scoped_lock lock{build_mutex};
             is_built = true;
-            build_condvar.notify_one();
+            build_condvar.notify_all();
             if (shader_notify) {
                 shader_notify->MarkShaderComplete();
             }
@@ -330,9 +330,9 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             );
         }
 
-        if (skip_until_built) {
-            LOG_INFO(Render_Vulkan, "Deferred compute shader {:016X} built in {:.1f} s",
-                     shader_hash, build_seconds());
+        if (skip_until_built && build_seconds() >= 0.05) {
+            LOG_WARNING(Render_Vulkan, "Deferred compute shader {:016X} built in {:.2f} s",
+                        shader_hash, build_seconds());
         }
         if (pipeline_statistics) {
             pipeline_statistics->Collect(device, *pipeline);
@@ -342,7 +342,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         spv_module.reset();
         std::scoped_lock lock{build_mutex};
         is_built = true;
-        build_condvar.notify_one();
+        build_condvar.notify_all();
         if (shader_notify) {
             shader_notify->MarkShaderComplete();
         }
@@ -387,6 +387,26 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                                 std::optional<ByteAddressedShadow>& shadow,
                                 BindCommand* deferred_bind) {
     shadow.reset();
+    if (skip_until_built && !first_use_waited) {
+        // Most compute shaders build in well under this: give the first dispatch a short wait,
+        // so only the slow builds (seconds on AMD's compiler) skip dispatches.
+        first_use_waited = true;
+        static const auto first_wait = [] {
+            const char* value = std::getenv("EDEN_NX2_ASYNC_COMPUTE_WAIT_MS");
+            return std::chrono::milliseconds{value ? std::strtol(value, nullptr, 10) : 50L};
+        }();
+        if (!is_built.load(std::memory_order::acquire) && first_wait.count() > 0) {
+            std::unique_lock lock{build_mutex};
+            build_condvar.wait_for(lock, first_wait,
+                                   [this] { return is_built.load(std::memory_order::relaxed); });
+        }
+        if (!is_built.load(std::memory_order::acquire)) {
+            LOG_WARNING(Render_Vulkan,
+                        "Compute shader {:016X} still building after {} ms; its dispatches are "
+                        "skipped until it is ready",
+                        shader_hash, first_wait.count());
+        }
+    }
     if (skip_until_built && (!is_built.load(std::memory_order::acquire) || !pipeline)) {
         if (!kepler_compute.IsNativeMode()) {
             return false;
