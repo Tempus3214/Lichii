@@ -3048,7 +3048,13 @@ void RasterizerVulkan::FlushWork() {
             }
             return std::nullopt;
         }();
-        budget = configured_budget.value_or(SubmissionPolicy::DefaultNativeBudget);
+        // AMD's driver pays much more per submission. Ocarina of Time on an RX 9070 XT: every 256
+        // draws instead of 128 gave +10-12 FPS where it was already fast, every 512 a further
+        // 35 -> 50 FPS at one spot standing still.
+        const u32 default_budget = device.GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY
+                                       ? SubmissionPolicy::AmdNativeBudget
+                                       : SubmissionPolicy::DefaultNativeBudget;
+        budget = configured_budget.value_or(default_budget);
     }
     u32 legacy_budget = 4096;
     if (!native && !android) {

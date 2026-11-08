@@ -11,6 +11,8 @@
 namespace Vulkan::SubmissionPolicy {
 
 inline constexpr u32 DefaultNativeBudget = 128;
+/// Draws per submission on AMD's proprietary driver (see RasterizerVulkan::FlushWork).
+inline constexpr u32 AmdNativeBudget = 512;
 
 enum class Action {
     None,

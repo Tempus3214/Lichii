@@ -5,19 +5,132 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <array>
+#include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
+#include <functional>
+#include <mutex>
 #include <span>
+#include <thread>
+#include <vector>
 
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/bit_util.h"
 #include "common/div_ceil.h"
+#include "common/thread.h"
 #include "video_core/gpu.h"
 #include "video_core/textures/decoders.h"
 
 namespace Tegra::Texture {
 namespace {
+
+/// Large unswizzles (new textures while running through Ocarina of Time's Kokiri Forest: ~11% of
+/// the split GPU back thread) are split by lines over helper threads plus the caller, which waits
+/// for all of them: the result is the same, only sooner. A quarter of the host threads, at most 4
+/// (more competed with the guest cores and made busy spots drop harder).
+class LinePool {
+public:
+    static LinePool& Get() {
+        static LinePool pool;
+        return pool;
+    }
+
+    [[nodiscard]] bool Enabled() const {
+        return !workers.empty();
+    }
+
+    /// Calls func(begin, end) over [0, count) in chunks; returns once every chunk is done.
+    void Run(u32 count, const std::function<void(u32, u32)>& func) {
+        std::unique_lock busy{run_mutex, std::try_to_lock};
+        if (!busy || workers.empty()) {
+            func(0, count);
+            return;
+        }
+        {
+            std::scoped_lock lock{mutex};
+            job = &func;
+            total = count;
+            chunk = (std::max)(8U, count / static_cast<u32>((workers.size() + 1) * 4));
+            next.store(0, std::memory_order_relaxed);
+            pending = static_cast<u32>(workers.size());
+            ++generation;
+        }
+        work_cv.notify_all();
+        Work(func);
+        std::unique_lock lock{mutex};
+        done_cv.wait(lock, [this] { return pending == 0; });
+        job = nullptr;
+    }
+
+private:
+    LinePool() {
+        const u32 count = (std::min)(4U, std::thread::hardware_concurrency() / 4);
+        for (u32 i = 0; i < count; ++i) {
+            workers.emplace_back([this](std::stop_token stop) { Loop(stop); });
+        }
+    }
+
+    ~LinePool() {
+        {
+            // Under the mutex: a worker between its predicate check and its wait would otherwise
+            // miss the notification and never return to be joined.
+            std::scoped_lock lock{mutex};
+            for (auto& worker : workers) {
+                worker.request_stop();
+            }
+        }
+        work_cv.notify_all();
+        workers.clear();
+    }
+
+    void Work(const std::function<void(u32, u32)>& func) {
+        for (;;) {
+            const u32 begin = next.fetch_add(chunk, std::memory_order_relaxed);
+            if (begin >= total) {
+                return;
+            }
+            func(begin, (std::min)(begin + chunk, total));
+        }
+    }
+
+    void Loop(std::stop_token stop) {
+        Common::SetCurrentThreadName("Unswizzle");
+        u64 seen = 0;
+        for (;;) {
+            const std::function<void(u32, u32)>* func;
+            {
+                std::unique_lock lock{mutex};
+                work_cv.wait(lock, [&] { return stop.stop_requested() || generation != seen; });
+                if (stop.stop_requested()) {
+                    return;
+                }
+                seen = generation;
+                func = job;
+            }
+            Work(*func);
+            {
+                std::scoped_lock lock{mutex};
+                --pending;
+            }
+            done_cv.notify_one();
+        }
+    }
+
+    std::mutex run_mutex;
+    std::mutex mutex;
+    std::condition_variable work_cv;
+    std::condition_variable done_cv;
+    const std::function<void(u32, u32)>* job{};
+    u32 total{};
+    u32 chunk{1};
+    std::atomic<u32> next{};
+    u32 pending{};
+    u64 generation{};
+    std::vector<std::jthread> workers;
+};
+
 constexpr u32 NativeGobOffset(u32 offset, bool native_tiling) {
     if (!native_tiling) return offset;
     const u32 difference = ((offset >> 5) ^ (offset >> 6)) & 1;
@@ -63,11 +176,15 @@ void SwizzleImpl(std::span<u8> output, std::span<const u8> input, u32 width, u32
     const u32 block_depth_mask = (1U << block_depth) - 1;
     const u32 x_shift = GOB_SIZE_SHIFT + block_height + block_depth;
 
-    for (u32 slice = 0; slice < depth; ++slice) {
+    // Each (slice, line) writes its own bytes of the output: lines can go to other threads.
+    const auto lines = [&](u32 first, u32 end) {
+    for (u32 index = first; index < end; ++index) {
+        const u32 slice = index / height;
+        const u32 line = index % height;
         const u32 z = slice + origin_z;
         const u32 offset_z = (z >> block_depth) * slice_size +
                              ((z & block_depth_mask) << (GOB_SIZE_SHIFT + block_height));
-        for (u32 line = 0; line < height; ++line) {
+        {
             const u32 y = line + origin_y;
             const u32 swizzled_y = pdep<SWIZZLE_Y_BITS>(y);
 
@@ -93,6 +210,15 @@ void SwizzleImpl(std::span<u8> output, std::span<const u8> input, u32 width, u32
                 std::memcpy(dst, src, BYTES_PER_PIXEL);
             }
         }
+    }
+    };
+    const u32 total_lines = depth * height;
+    // From 1 MiB: splitting medium textures too (256 KiB) made busy spots drop harder.
+    constexpr u64 min_bytes = u64{1} << 20;
+    if (!TO_LINEAR && LinePool::Get().Enabled() && u64{pitch} * total_lines >= min_bytes) {
+        LinePool::Get().Run(total_lines, lines);
+    } else {
+        lines(0, total_lines);
     }
 }
 
